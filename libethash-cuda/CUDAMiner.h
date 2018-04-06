@@ -17,21 +17,14 @@ along with cpp-ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 #pragma once
 
-#define _CRT_SECURE_NO_WARNINGS
-
 #include <time.h>
 #include <functional>
 #include <libethash/ethash.h>
 #include <libdevcore/Worker.h>
 #include <libethcore/EthashAux.h>
 #include <libethcore/Miner.h>
-#include <libethcore/Miner.h>
-#include <libhwmon/wrapnvml.h>
 #include "ethash_cuda_miner_kernel.h"
 #include "libethash/internal.h"
-
-#define SHUFFLE_MIN_VER 300 //__CUDA_ARCH_
-#define SHUFFLE_DEPRECATED 9000 //CUDA_VERSION
 
 namespace dev
 {
@@ -59,19 +52,21 @@ public:
 		unsigned _scheduleFlag,
 		uint64_t _currentBlock,
 		unsigned _dagLoadMode,
-		unsigned _dagCreateDevice
+		unsigned _dagCreateDevice,
+		bool _noeval,
+		bool _exit
 		);
 	static void setNumInstances(unsigned _instances);
-	static void setDevices(const unsigned* _devices, unsigned _selectedDeviceCount);
-	HwMonitor hwmon() override;
+	static void setDevices(const vector<unsigned>& _devices, unsigned _selectedDeviceCount);
 	static bool cuda_configureGPU(
 		size_t numDevices,
-		const int* _devices,
+		const vector<int>& _devices,
 		unsigned _blockSize,
 		unsigned _gridSize,
 		unsigned _numStreams,
 		unsigned _scheduleFlag,
-		uint64_t _currentBlock
+		uint64_t _currentBlock,
+		bool _noeval
 		);
 
 	static void cuda_setParallelHash(unsigned _parallelHash);
@@ -92,7 +87,6 @@ public:
 		bool _ethStratum,
 		uint64_t _startN,
 		const dev::eth::WorkPackage& w);
-		dev::eth::HwMonitor cuda_hwmon();
 
 	/* -- default values -- */
 	/// Default value of the block size. Also known as workgroup size.
@@ -106,18 +100,17 @@ protected:
 	void kick_miner() override;
 
 private:
-	bool m_abort = false;
+	atomic<bool> m_new_work = {false};
 
 	void workLoop() override;
 
-	bool init(const h256& seed);
+	bool init(int epoch);
 
 	hash32_t m_current_header;
 	uint64_t m_current_target;
 	uint64_t m_current_nonce;
 	uint64_t m_starting_nonce;
 	uint64_t m_current_index;
-	uint32_t m_sharedBytes;
 
 	///Constants on GPU
 	hash128_t* m_dag = nullptr;
@@ -125,7 +118,7 @@ private:
 	uint32_t m_dag_size = -1;
 	uint32_t m_device_num;
 
-	volatile uint32_t ** m_search_buf;
+	volatile search_results** m_search_buf;
 	cudaStream_t  * m_streams;
 
 	/// The local work size for the search
@@ -139,10 +132,11 @@ private:
 
 	static unsigned m_parallelHash;
 
-	wrap_nvml_handle *nvmlh = nullptr;
-
 	static unsigned s_numInstances;
-	static int s_devices[16];
+	static vector<int> s_devices;
+
+	static bool s_noeval;
+
 };
 
 

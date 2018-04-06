@@ -1,6 +1,9 @@
+#pragma once
+
 #include <iostream>
 #include <boost/array.hpp>
 #include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
 #include <boost/bind.hpp>
 #include <json/json.h>
 #include <libdevcore/Log.h>
@@ -8,85 +11,97 @@
 #include <libethcore/Farm.h>
 #include <libethcore/EthashAux.h>
 #include <libethcore/Miner.h>
-#include "BuildInfo.h"
+#include "../PoolClient.h"
 
 
 using namespace std;
 using namespace dev;
 using namespace dev::eth;
 
-
-class EthStratumClient
+class EthStratumClient : public PoolClient
 {
 public:
-	EthStratumClient(Farm* f, MinerType m, string const & host, string const & port, string const & user, string const & pass, int const & retries, int const & worktimeout, int const & protocol, string const & email);
+
+	typedef enum { STRATUM = 0, ETHPROXY, ETHEREUMSTRATUM } StratumProtocol;
+
+	EthStratumClient(int const & worktimeout, string const & email, bool const & submitHashrate);
 	~EthStratumClient();
 
-	void setFailover(string const & host, string const & port);
-	void setFailover(string const & host, string const & port, string const & user, string const & pass);
+	void connect();
+	void disconnect();
+	
+	bool isConnected() { return m_connected.load(std::memory_order_relaxed) && m_authorized; }
+	
+	void submitHashrate(string const & rate);
+	void submitSolution(Solution solution);
 
-	bool isRunning() { return m_running; }
-	bool isConnected() { return m_connected && m_authorized; }
 	h256 currentHeaderHash() { return m_current.header; }
 	bool current() { return static_cast<bool>(m_current); }
-	bool submitHashrate(string const & rate);
-	bool submit(Solution solution);
-	void reconnect();
+
 private:
-	void connect();
-	
-	void disconnect();
+
 	void resolve_handler(const boost::system::error_code& ec, boost::asio::ip::tcp::resolver::iterator i);
 	void connect_handler(const boost::system::error_code& ec, boost::asio::ip::tcp::resolver::iterator i);
 	void work_timeout_handler(const boost::system::error_code& ec);
+	void response_timeout_handler(const boost::system::error_code& ec);
+	void hashrate_event_handler(const boost::system::error_code& ec);
 
+	void reset_work_timeout();
 	void readline();
 	void handleResponse(const boost::system::error_code& ec);
+	void handleHashrateResponse(const boost::system::error_code& ec);
 	void readResponse(const boost::system::error_code& ec, std::size_t bytes_transferred);
 	void processReponse(Json::Value& responseObject);
-	
-	MinerType m_minerType;
+	void async_write_with_response();
 
-	cred_t * p_active;
-	cred_t m_primary;
-	cred_t m_failover;
+	PoolConnection m_connection;
 
 	string m_worker; // eth-proxy only;
 
 	bool m_authorized;
-	bool m_connected;
-	bool m_running = true;
+	std::atomic<bool> m_connected = {false};
 
-	int	m_retries = 0;
-	int	m_maxRetries;
 	int m_worktimeout = 60;
 
 	std::mutex x_pending;
 	int m_pending;
 
-	Farm* p_farm;
 	WorkPackage m_current;
 
 	bool m_stale = false;
 
 	std::thread m_serviceThread;  ///< The IO service thread.
 	boost::asio::io_service m_io_service;
-	boost::asio::ip::tcp::socket m_socket;
+	boost::asio::ip::tcp::socket *m_socket;
+	// Use shared ptrs to avoid crashes due to async_writes
+	// see https://stackoverflow.com/questions/41526553/can-async-write-cause-segmentation-fault-when-this-is-deleted
+	std::shared_ptr<boost::asio::ssl::stream<boost::asio::ip::tcp::socket> >
+	  m_securesocket;
+	std::shared_ptr<boost::asio::ip::tcp::socket>
+	  m_nonsecuresocket;
 
 	boost::asio::streambuf m_requestBuffer;
 	boost::asio::streambuf m_responseBuffer;
 
 	boost::asio::deadline_timer m_worktimer;
+	boost::asio::deadline_timer m_responsetimer;
+	boost::asio::deadline_timer m_hashrate_event;
+	bool m_response_pending = false;
 
-	int m_protocol;
+	boost::asio::ip::tcp::resolver m_resolver;
+
 	string m_email;
+	string m_rate;
 
 	double m_nextWorkDifficulty;
 
 	h64 m_extraNonce;
 	int m_extraNonceHexSize;
 	
+	bool m_submit_hashrate = false;
 	string m_submit_hashrate_id;
 
 	void processExtranonce(std::string& enonce);
+
+	bool m_linkdown = true;
 };

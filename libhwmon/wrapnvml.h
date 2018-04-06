@@ -14,8 +14,7 @@
  *
  */
 
-#ifndef _WRAPNVML_H_
-#define _WRAPNVML_H_
+#pragma once
 
 #if defined(__cplusplus)
 extern "C" {
@@ -55,11 +54,14 @@ typedef struct {
   void *nvml_dll;
   int nvml_gpucount;
   int cuda_gpucount;
+  int opencl_gpucount;
   unsigned int *nvml_pci_domain_id;
   unsigned int *nvml_pci_bus_id;
   unsigned int *nvml_pci_device_id;
   int *nvml_cuda_device_id;          /* map NVML dev to CUDA dev */
   int *cuda_nvml_device_id;          /* map CUDA dev to NVML dev */
+  int *nvml_opencl_device_id;          /* map NVML dev to OPENCL dev */
+  int *opencl_nvml_device_id;          /* map OPENCL dev to NVML dev */
   wrap_nvmlDevice_t *devs;
   wrap_nvmlReturn_t (*nvmlInit)(void);
   wrap_nvmlReturn_t (*nvmlDeviceGetCount)(int *);
@@ -109,7 +111,7 @@ int wrap_nvml_get_fanpcnt(wrap_nvml_handle *nvmlh,
                           int gpuindex, unsigned int *fanpcnt);
 
 /* 
- * Query the current GPU power usage in millwatts from the CUDA device ID
+ * Query the current GPU power usage in milliwatts from the CUDA device ID
  *
  * This feature is only available on recent GPU generations and may be
  * limited in some cases only to Tesla series GPUs.
@@ -124,4 +126,3 @@ int wrap_nvml_get_power_usage(wrap_nvml_handle *nvmlh,
 }
 #endif
 
-#endif

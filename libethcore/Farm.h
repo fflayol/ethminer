@@ -30,6 +30,11 @@
 #include <libdevcore/Worker.h>
 #include <libethcore/Miner.h>
 #include <libethcore/BlockHeader.h>
+#include <libhwmon/wrapnvml.h>
+#include <libhwmon/wrapadl.h>
+#if defined(__linux)
+#include <libhwmon/wrapamdsysfs.h>
+#endif
 
 namespace dev
 {
@@ -51,8 +56,36 @@ public:
 		std::function<Miner*(FarmFace&, unsigned)> create;
 	};
 
+	Farm(): m_hashrateTimer(m_io_service)
+	{
+		// Given that all nonces are equally likely to solve the problem
+		// we could reasonably always start the nonce search ranges
+		// at a fixed place, but that would be boring. Provide a once
+		// per run randomized start place, without creating much overhead.
+		random_device engine;
+		m_nonce_scrambler = uniform_int_distribution<uint64_t>()(engine);
+
+		// Init HWMON
+		adlh = wrap_adl_create();
+#if defined(__linux)
+		sysfsh = wrap_amdsysfs_create();
+#endif
+		nvmlh = wrap_nvml_create();
+	}
+
 	~Farm()
 	{
+		// Deinit HWMON
+		if (adlh)
+			wrap_adl_destroy(adlh);
+#if defined(__linux)
+		if (sysfsh)
+			wrap_amdsysfs_destroy(sysfsh);
+#endif
+		if (nvmlh)
+			wrap_nvml_destroy(nvmlh);
+
+		// Stop mining
 		stop();
 	}
 
@@ -99,6 +132,7 @@ public:
 		}
 		else
 		{
+
 			start = m_miners.size();
 			ins += start;
 			m_miners.reserve(ins);
@@ -116,16 +150,17 @@ public:
 		m_lastSealer = _sealer;
 		b_lastMixed = mixed;
 
-		if (!p_hashrateTimer) {
-			p_hashrateTimer = new boost::asio::deadline_timer(m_io_service, boost::posix_time::milliseconds(1000));
-			p_hashrateTimer->async_wait(boost::bind(&Farm::processHashRate, this, boost::asio::placeholders::error));
-			if (m_serviceThread.joinable()) {
-				m_io_service.reset();
-			}
-			else {
-				m_serviceThread = std::thread{ boost::bind(&boost::asio::io_service::run, &m_io_service) };
-			}
+		// Start hashrate collector
+		m_hashrateTimer.cancel();
+		m_hashrateTimer.expires_from_now(boost::posix_time::milliseconds(1000));
+		m_hashrateTimer.async_wait(boost::bind(&Farm::processHashRate, this, boost::asio::placeholders::error));
+
+		if (m_serviceThread.joinable()) {
+			m_io_service.reset();
+			m_serviceThread.join();
 		}
+
+		m_serviceThread = std::thread{ boost::bind(&boost::asio::io_service::run, &m_io_service) };
 
 		return true;
 	}
@@ -141,58 +176,56 @@ public:
 			m_isMining = false;
 		}
 
+		m_hashrateTimer.cancel();
 		m_io_service.stop();
-		m_serviceThread.join();
 
-		if (p_hashrateTimer) {
-			p_hashrateTimer->cancel();
-			p_hashrateTimer = nullptr;
-		}
+		m_lastProgresses.clear();
 	}
 
-	void collectHashRate()
-	{
-		WorkingProgress p;
-		Guard l2(x_minerWork);
-		p.ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - m_lastStart).count();
-		//Collect
-		for (auto const& i : m_miners)
-		{
-			uint64_t minerHashCount = i->hashCount();
-			p.hashes += minerHashCount;
-			p.minersHashes.push_back(minerHashCount);
-		}
+    void collectHashRate()
+    {
+        auto now = std::chrono::steady_clock::now();
 
-		//Reset
-		for (auto const& i : m_miners)
-		{
-			i->resetHashCount();
-		}
-		m_lastStart = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(x_minerWork);
 
-		if (p.hashes > 0) {
-			m_lastProgresses.push_back(p);
-		}
+        WorkingProgress p;
+        p.ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastStart).count();
+        m_lastStart = now;
 
-		// We smooth the hashrate over the last x seconds
-		int allMs = 0;
-		for (auto const& cp : m_lastProgresses) {
-			allMs += cp.ms;
-		}
-		if (allMs > m_hashrateSmoothInterval) {
-			m_lastProgresses.erase(m_lastProgresses.begin());
-		}
-	}
+        // Collect
+        for (auto const& i : m_miners)
+        {
+            uint64_t minerHashCount = i->hashCount();
+            p.hashes += minerHashCount;
+            p.minersHashes.push_back(minerHashCount);
+        }
+
+        // Reset
+        for (auto const& i : m_miners)
+            i->resetHashCount();
+
+        if (p.hashes > 0)
+            m_lastProgresses.push_back(p);
+
+        // We smooth the hashrate over the last x seconds
+        uint64_t allMs = 0;
+        for (auto const& cp : m_lastProgresses)
+            allMs += cp.ms;
+
+        if (allMs > m_hashrateSmoothInterval)
+            m_lastProgresses.erase(m_lastProgresses.begin());
+    }
 
 	void processHashRate(const boost::system::error_code& ec) {
 
 		if (!ec) {
 			collectHashRate();
-		}
 
-		// Restart timer 	
-		p_hashrateTimer->expires_at(p_hashrateTimer->expires_at() + boost::posix_time::milliseconds(1000));
-		p_hashrateTimer->async_wait(boost::bind(&Farm::processHashRate, this, boost::asio::placeholders::error));
+			// Restart timer 	
+			m_hashrateTimer.cancel();
+			m_hashrateTimer.expires_from_now(boost::posix_time::milliseconds(1000));
+			m_hashrateTimer.async_wait(boost::bind(&Farm::processHashRate, this, boost::asio::placeholders::error));
+		}
 	}
 	
 	/**
@@ -200,9 +233,6 @@ public:
 	 */
 	void restart()
 	{
-		stop();
-		start(m_lastSealer, b_lastMixed);
-		
 		if (m_onMinerRestart) {
 			m_onMinerRestart();
 		}
@@ -213,43 +243,102 @@ public:
 		return m_isMining;
 	}
 
-	/**
-	 * @brief Get information on the progress of mining this work package.
-	 * @return The progress with mining so far.
-	 */
-	WorkingProgress const& miningProgress(bool hwmon = false) const
-	{
-		WorkingProgress p;
-		p.ms = 0;
-		p.hashes = 0;
-		{
-			Guard l2(x_minerWork);
-			for (auto const& i : m_miners) {
-				p.minersHashes.push_back(0);
-				if (hwmon)
-					p.minerMonitors.push_back(i->hwmon());
+    /**
+     * @brief Get information on the progress of mining this work package.
+     * @return The progress with mining so far.
+     */
+    WorkingProgress const& miningProgress(bool hwmon = false, bool power = false) const
+    {
+        std::lock_guard<std::mutex> lock(x_minerWork);
+        WorkingProgress p;
+        p.ms = 0;
+        p.hashes = 0;
+        for (auto const& i : m_miners)
+        {
+            p.minersHashes.push_back(0);
+			if (hwmon) {
+				HwMonitorInfo hwInfo = i->hwmonInfo();
+				HwMonitor hw;
+				unsigned int tempC = 0, fanpcnt = 0, powerW = 0;
+				if (hwInfo.deviceIndex >= 0) {
+					if (hwInfo.deviceType == HwMonitorInfoType::NVIDIA && nvmlh) {
+						int typeidx = 0;
+						if(hwInfo.indexSource == HwMonitorIndexSource::CUDA){
+							typeidx = nvmlh->cuda_nvml_device_id[hwInfo.deviceIndex];
+						}
+						else if(hwInfo.indexSource == HwMonitorIndexSource::OPENCL){
+							typeidx = nvmlh->opencl_nvml_device_id[hwInfo.deviceIndex];
+						}
+						else{
+							//Unknown, don't map
+							typeidx = hwInfo.deviceIndex;
+						}
+						wrap_nvml_get_tempC(nvmlh, typeidx, &tempC);
+						wrap_nvml_get_fanpcnt(nvmlh, typeidx, &fanpcnt);
+						if(power) {
+							wrap_nvml_get_power_usage(nvmlh, typeidx, &powerW);
+						}
+					}
+					else if (hwInfo.deviceType == HwMonitorInfoType::AMD && adlh) {
+						int typeidx = 0;
+						if(hwInfo.indexSource == HwMonitorIndexSource::OPENCL){
+							typeidx = adlh->opencl_adl_device_id[hwInfo.deviceIndex];
+						}
+						else{
+							//Unknown, don't map
+							typeidx = hwInfo.deviceIndex;
+						}
+						wrap_adl_get_tempC(adlh, typeidx, &tempC);
+						wrap_adl_get_fanpcnt(adlh, typeidx, &fanpcnt);
+						if(power) {
+							wrap_adl_get_power_usage(adlh, typeidx, &powerW);
+						}
+					}
+#if defined(__linux)
+					// Overwrite with sysfs data if present
+					if (hwInfo.deviceType == HwMonitorInfoType::AMD && sysfsh) {
+						int typeidx = 0;
+						if(hwInfo.indexSource == HwMonitorIndexSource::OPENCL){
+							typeidx = sysfsh->opencl_sysfs_device_id[hwInfo.deviceIndex];
+						}
+						else{
+							//Unknown, don't map
+							typeidx = hwInfo.deviceIndex;
+						}
+						wrap_amdsysfs_get_tempC(sysfsh, typeidx, &tempC);
+						wrap_amdsysfs_get_fanpcnt(sysfsh, typeidx, &fanpcnt);
+						if(power) {
+							wrap_amdsysfs_get_power_usage(sysfsh, typeidx, &powerW);
+						}
+					}
+#endif
+				}
+				hw.tempC = tempC;
+				hw.fanP = fanpcnt;
+				hw.powerW = powerW/((double)1000.0);
+				p.minerMonitors.push_back(hw);
 			}
-		}
+        }
 
-		for (auto const& cp : m_lastProgresses) {
-			p.ms += cp.ms;
-			p.hashes += cp.hashes;
-			for (unsigned int i = 0; i < cp.minersHashes.size(); i++)
-			{
-				p.minersHashes.at(i) += cp.minersHashes.at(i);
-			}
-		}
+        for (auto const& cp : m_lastProgresses)
+        {
+            p.ms += cp.ms;
+            p.hashes += cp.hashes;
+            for (unsigned int i = 0; i < cp.minersHashes.size() && i < p.minersHashes.size(); i++)
+            {
+                p.minersHashes.at(i) += cp.minersHashes.at(i);
+            }
+        }
 
-		Guard l(x_progress);
-		m_progress = p;
-		return m_progress;
-	}
+        m_progress = p;
+        return m_progress;
+    }
 
 	SolutionStats getSolutionStats() {
 		return m_solutionStats;
 	}
 
-	void failedSolution() {
+	void failedSolution() override {
 		m_solutionStats.failed();
 	}
 
@@ -275,7 +364,7 @@ public:
 		}
 	}
 
-	using SolutionFound = std::function<bool(Solution const&)>;
+	using SolutionFound = std::function<void(Solution const&)>;
 	using MinerRestart = std::function<void()>;
 
 	/**
@@ -306,15 +395,20 @@ public:
 		return stream.str();
 	}
 
-    void set_pool_addresses(string primaryUrl, string primaryPort, string failoverUrl, string failoverPort) {
-        m_pool_addresses = primaryUrl + ":" + primaryPort;
-        if (failoverUrl != "")
-            m_pool_addresses += ";" + failoverUrl + ":" + failoverPort;
-    }
+	void set_pool_addresses(string host, unsigned port) {
+		stringstream ssPoolAddresses;
+		ssPoolAddresses << host << ':' << port;
+		m_pool_addresses = ssPoolAddresses.str();
+	}
 
-    string get_pool_addresses() {
-        return m_pool_addresses;
-    }
+	string get_pool_addresses() {
+		return m_pool_addresses;
+	}
+
+	uint64_t get_nonce_scrambler() override
+	{
+		return m_nonce_scrambler;
+	}
 
 private:
 	/**
@@ -323,10 +417,10 @@ private:
 	 * @param _wp The WorkPackage that the Solution is for.
 	 * @return true iff the solution was good (implying that mining should be .
 	 */
-	bool submitProof(Solution const& _s) override
+	void submitProof(Solution const& _s) override
 	{
 		assert(m_onSolutionFound);
-		return m_onSolutionFound(_s);
+		m_onSolutionFound(_s);
 	}
 
 	mutable Mutex x_minerWork;
@@ -335,10 +429,7 @@ private:
 
 	std::atomic<bool> m_isMining = {false};
 
-	mutable Mutex x_progress;
 	mutable WorkingProgress m_progress;
-
-	mutable Mutex x_hwmons;
 
 	SolutionFound m_onSolutionFound;
 	MinerRestart m_onMinerRestart;
@@ -348,16 +439,23 @@ private:
 	bool b_lastMixed = false;
 
 	std::chrono::steady_clock::time_point m_lastStart;
-	int m_hashrateSmoothInterval = 10000;
+	uint64_t m_hashrateSmoothInterval = 10000;
 	std::thread m_serviceThread;  ///< The IO service thread.
 	boost::asio::io_service m_io_service;
-	boost::asio::deadline_timer * p_hashrateTimer = nullptr;
+	boost::asio::deadline_timer m_hashrateTimer;
 	std::vector<WorkingProgress> m_lastProgresses;
 
 	mutable SolutionStats m_solutionStats;
 	std::chrono::steady_clock::time_point m_farm_launched = std::chrono::steady_clock::now();
 
-    string m_pool_addresses;
+    	string m_pool_addresses;
+	uint64_t m_nonce_scrambler;
+
+	wrap_nvml_handle *nvmlh = NULL;
+	wrap_adl_handle *adlh = NULL;
+#if defined(__linux)
+	wrap_amdsysfs_handle *sysfsh = NULL;
+#endif
 }; 
 
 }

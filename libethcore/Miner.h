@@ -37,18 +37,7 @@
 #define DAG_LOAD_MODE_SEQUENTIAL 1
 #define DAG_LOAD_MODE_SINGLE	 2
 
-#define STRATUM_PROTOCOL_STRATUM		 0
-#define STRATUM_PROTOCOL_ETHPROXY		 1
-#define STRATUM_PROTOCOL_ETHEREUMSTRATUM 2
-
 using namespace std;
-
-typedef struct {
-	string host;
-	string port;
-	string user;
-	string pass;
-} cred_t;
 
 namespace dev
 {
@@ -63,15 +52,44 @@ enum class MinerType
 	CUDA
 };
 
+enum class HwMonitorInfoType
+{
+	UNKNOWN,
+	NVIDIA,
+	AMD
+};
+
+enum class HwMonitorIndexSource
+{
+	UNKNOWN,
+	OPENCL,
+	CUDA
+};
+
+struct HwMonitorInfo
+{
+	HwMonitorInfoType deviceType = HwMonitorInfoType::UNKNOWN;
+	HwMonitorIndexSource indexSource = HwMonitorIndexSource::UNKNOWN;
+	int deviceIndex = -1;
+
+};
+
 struct HwMonitor
 {
 	int tempC = 0;
 	int fanP = 0;
+	double powerW = 0;
 };
 
 inline std::ostream& operator<<(std::ostream& os, HwMonitor _hw)
 {
-	return os << _hw.tempC << "C " << _hw.fanP << "%";
+	string power = "";
+	if(_hw.powerW != 0){
+		ostringstream stream;
+		stream << fixed << setprecision(0) << _hw.powerW << "W";
+		power = stream.str();
+	}
+	return os << _hw.tempC << "C " << _hw.fanP << "% " << power;
 }
 
 /// Describes the progress of a mining operation.
@@ -114,7 +132,6 @@ public:
 	void acceptedStale() { acceptedStales++; }
 	void rejectedStale() { rejectedStales++; }
 
-
 	void reset() { accepts = rejects = failures = acceptedStales = rejectedStales = 0; }
 
 	unsigned getAccepts()			{ return accepts; }
@@ -154,17 +171,22 @@ public:
 	 * @param _p The solution.
 	 * @return true iff the solution was good (implying that mining should be .
 	 */
-	virtual bool submitProof(Solution const& _p) = 0;
+	virtual void submitProof(Solution const& _p) = 0;
 	virtual void failedSolution() = 0;
+	virtual uint64_t get_nonce_scrambler() = 0;
 };
 
 /**
  * @brief A miner - a member and adoptee of the Farm.
  * @warning Not threadsafe. It is assumed Farm will synchronise calls to/from this class.
  */
+#define LOG2_MAX_MINERS 5u
+#define MAX_MINERS (1u << LOG2_MAX_MINERS)
+
 class Miner: public Worker
 {
 public:
+
 	Miner(std::string const& _name, FarmFace& _farm, size_t _index):
 		Worker(_name + std::to_string(_index)),
 		index(_index),
@@ -183,13 +205,18 @@ public:
 		kick_miner();
 	}
 
-	uint64_t hashCount() const { return m_hashCount; }
+	uint64_t hashCount() const { return m_hashCount.load(std::memory_order_relaxed); }
 
-	void resetHashCount() { m_hashCount = 0; }
-
-	virtual HwMonitor hwmon() = 0;
+	void resetHashCount() { m_hashCount.store(0, std::memory_order_relaxed); }
 
 	unsigned Index() { return index; };
+	HwMonitorInfo hwmonInfo() { return m_hwmoninfo; }
+
+	uint64_t get_start_nonce()
+	{
+		// Each GPU is given a non-overlapping 2^40 range to search
+		return farm.get_nonce_scrambler() + ((uint64_t) index << 40);
+	}
 
 protected:
 
@@ -200,19 +227,20 @@ protected:
 
 	WorkPackage work() const { Guard l(x_work); return m_work; }
 
-	void addHashCount(uint64_t _n) { m_hashCount += _n; }
+	void addHashCount(uint64_t _n) { m_hashCount.fetch_add(_n, std::memory_order_relaxed); }
 
 	static unsigned s_dagLoadMode;
 	static unsigned s_dagLoadIndex;
 	static unsigned s_dagCreateDevice;
 	static uint8_t* s_dagInHostMemory;
+	static bool s_exit;
 
 	const size_t index = 0;
 	FarmFace& farm;
 	std::chrono::high_resolution_clock::time_point workSwitchStart;
-
+	HwMonitorInfo m_hwmoninfo;
 private:
-	uint64_t m_hashCount = 0;
+	std::atomic<uint64_t> m_hashCount = {0};
 
 	WorkPackage m_work;
 	mutable Mutex x_work;
